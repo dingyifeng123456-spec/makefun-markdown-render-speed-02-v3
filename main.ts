@@ -199,9 +199,14 @@ function stripFenceIndent(eff, cc, indent, expandTabs) {
     const ch = eff[cc.pos];
     if (ch === ' ') { cc.pos++; cc.col++; n--; }
     else if (ch === '\t') {
+      // A tab counts as ONE character of the fence indent to strip
+      // (probed: fence indent 2 + '\t  "key"' leaves 1 space, indent
+      // 3 leaves 0; the tab itself is removed entirely and stripping
+      // continues with the remaining budget). The column still
+      // advances by the tab's expanded width, for the expandTabs
+      // path below.
       const w = 4 - (cc.col % 4);
-      if (w <= n) { cc.pos++; cc.col += w; n -= w; }
-      else { cc.pos++; cc.col += w; n = 0; }
+      cc.pos++; cc.col += w; n -= 1;
     } else break;
   }
   if (!expandTabs) return eff.slice(cc.pos);
@@ -555,6 +560,35 @@ function lazyItemContent(line, col, item) {
   return ' '.repeat(r) + line.slice(ind.pos);
 }
 
+// marked trims trailing spaces/tabs from the last source line of each
+// list block (probed: only the last item's last line loses them, and it
+// reaches through nested lists and blockquotes to the deepest last leaf;
+// a closed fence's content keeps them, an unclosed fence's last content
+// line does not). Walk every list after parsing and trim that leaf's
+// last line (para text is already frozen in b.text by then).
+function trimListTails(node) {
+  if (!node || !node.ch) return;
+  if (node.t === 'list') {
+    let cur = node;
+    while (cur && cur.ch && cur.ch.length) {
+      const last = cur.ch[cur.ch.length - 1];
+      if (cur.t === 'list' || cur.t === 'item' || cur.t === 'bq') { cur = last; continue; }
+      break;
+    }
+    if (cur && cur !== node) {
+      if (cur.t === 'para' && typeof cur.text === 'string') {
+        const li = cur.text.lastIndexOf('\n');
+        const tail = li < 0 ? cur.text : cur.text.slice(li + 1);
+        cur.text = (li < 0 ? '' : cur.text.slice(0, li + 1)) + tail.replace(/[ \t]+$/, '');
+      } else if ((cur.t === 'code' || cur.t === 'fence' || cur.t === 'html') && cur.lines && cur.lines.length) {
+        const ls = cur.lines;
+        ls[ls.length - 1] = ls[ls.length - 1].replace(/[ \t]+$/, '');
+      }
+    }
+  }
+  for (const c of node.ch) trimListTails(c);
+}
+
 function parseBlocks(src, refs) {
   const lines = splitLines(src);
   const blankSet = new Set();
@@ -574,12 +608,17 @@ function parseBlocks(src, refs) {
     if (b.t === 'code') {
       while (b.lines.length && b.lines[b.lines.length - 1] === '') b.lines.pop();
     }
-    if (b.t === 'item') {
-      // A list item's text is trailing-whitespace trimmed.
-      const last = b.ch[b.ch.length - 1];
-      if (last && (last.t === 'para' || last.t === 'code' || last.t === 'html')) {
-        const ls = last.lines;
-        if (ls && ls.length) ls[ls.length - 1] = ls[ls.length - 1].replace(/[ \t]+$/, '');
+    if (b.t === 'fence' && stack.some(x => x.t === 'bq' || x.t === 'item')) {
+      // An unclosed fence inside a container (list item / blockquote)
+      // ends with the container: its last line is not fence content
+      // (probed: with 1, 2, 3 trailing blank lines the code keeps 0, 1,
+      // 2 of them past the renderer's own one-line drop, i.e. exactly
+      // one trailing blank line is lost here). A closing fence pops the
+      // block directly, so this only fires for unclosed fences; a
+      // top-level fence keeps its blank lines.
+      if (b.lines.length && b.lines[b.lines.length - 1] === '') {
+        b.lines.pop();
+        b.el -= 1;
       }
     }
     return b;
@@ -748,6 +787,7 @@ function parseBlocks(src, refs) {
         }
         const item = newBlock('item', i);
         item.contentIndent = lm.contentIndent;
+        item.markerCol = lm.markerCol;
         item.baseCol = cur.col;
         addChild(list, item);
         stack.push(item);
@@ -865,15 +905,31 @@ function parseBlocks(src, refs) {
       // where the blockquote's marker would have to sit — the line is
       // outside the blockquote, hence outside the fence (doc-36: the
       // '~~~~' fence inside a blockquote ends when the next list item
-      // starts, instead of swallowing it as code).
+      // starts, instead of swallowing it as code). And a line is never
+      // absorbed when it follows a blank line (the fence ended there:
+      // the blank line closed the item's fence content, so the next
+      // unindented line is a new top-level block) or when it is a list
+      // marker (it starts a new item or list instead, ordered or not).
       let bqBetween = false;
       for (let si = failedIdx + 1; si < stack.length - 1; si++) {
         if (stack[si].t === 'bq') { bqBetween = true; break; }
       }
-      if (t && t.t === 'fence' && failedType === 'item' && !bqBetween && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
+      if (t && t.t === 'fence' && failedType === 'item' && !bqBetween && !lastLineBlank && !t.afterFenceLike && !listMarker(line, cur.pos, cur.col) && !interruptsPara(line, cur.pos, cur.col, true) && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const cc = { pos: 0, col: cur.col - pad };
-        t.lines.push(stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0));
+        const content = stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0);
+        // A fence-like line absorbed as content ends absorption for
+        // the lines after it; a plain absorbed line clears it again
+        // (probed: a matched '  -removed line' after the fence-like
+        // line lets the following failing line be absorbed again).
+        {
+          const ind = indentOf(content, 0, 0);
+          const p = ind.pos;
+          t.afterFenceLike = ind.cols <= 3 && p < content.length &&
+            ((content[p] === '`' && content.slice(p, p + 3) === '```') ||
+             (content[p] === '~' && content.slice(p, p + 3) === '~~~'));
+        }
+        t.lines.push(content);
         t.el = i;
         lastLineBlank = false;
         continue;
@@ -887,24 +943,135 @@ function parseBlocks(src, refs) {
         continue;
       }
       const lazyOk = t && t.t === 'para';
-      // A list marker is never a lazy continuation of a paragraph inside
-      // a list item (it starts a new item or a new list instead).
-      const isListMarker = failedType === 'item' && listMarker(line, cur.pos, cur.col);
+      // A list marker is never a lazy continuation of a paragraph: it
+      // starts a new item or list in whatever container it does match,
+      // even when the container it fails is a blockquote rather than
+      // an item (probed: '>    > Quote...\n> 5. V2.1.0...' starts a new
+      // <ol> in the outer blockquote after the inner one ends).
+      const isListMarker = listMarker(line, cur.pos, cur.col);
       const paraParent = stack.length >= 2 ? stack[stack.length - 2] : null;
-      if (lazyOk && !isListMarker && !interruptsPara(line, cur.pos, cur.col, paraParent && paraParent.t === 'item')) {
+      // Lazy-continuation depth limit: a line that fails the outermost
+      // list item is not a lazy continuation of a paragraph whose
+      // item's marker sits at column 6 or more (probed: doc-12;
+      // '- a\n  - b\n      - c\nplain' and '[foo]: /url' both end up
+      // outside the list, while '  plain' — matching the outer item
+      // — stays lazy, and a marker at column 5 or less stays lazy
+      // even with a long ordered marker: '252418. Quote...\nValid...'
+      // and '123456789. x\nplain' both stay lazy, so the limit is on
+      // the marker column, not the content indent).
+      let tooDeepToBeLazy = false;
+      if (failedType === 'item') {
+        let paraItem = null;
+        for (let j = stack.length - 2; j >= 0; j--) { if (stack[j].t === 'item') { paraItem = stack[j]; break; } }
+        let outermostItemIdx = -1;
+        for (let j = 0; j < stack.length; j++) { if (stack[j].t === 'item') { outermostItemIdx = j; break; } }
+        if (paraItem && outermostItemIdx >= 0 && failedIdx === outermostItemIdx && (paraItem.markerCol ?? 0) >= 6) tooDeepToBeLazy = true;
+      }
+      if (lazyOk && !isListMarker && !tooDeepToBeLazy && !(t.afterFenceLike && failedType === 'item') && !interruptsPara(line, cur.pos, cur.col, paraParent && paraParent.t === 'item')) {
         // Lazy continuation line: the content is the line after the
-        // containers that did match.
+        // containers that did match. But after an over-indented line
+        // (para.over) a line that fails the item is not lazy at all —
+        // the item ends there (probed: '4. a\n       b\nc' puts 'c'
+        // outside the list). A line that fails only a blockquote while
+        // the paragraph belongs to an item inside it ends the item but
+        // stays in the blockquote as a new block (probed: '> - a\n>
+        // b\n>       c\nd' puts 'd' in the blockquote, outside the item).
         const para = t;
-        const container = stack[failedIdx];
-        const effLine = ' '.repeat(pad) + line.slice(cur.pos);
-        const effCol = cur.col - pad;
-        let content;
-        if (failedType === 'bq') content = lazyBqContent(effLine, effCol, para);
-        else content = lazyItemContent(effLine, effCol, container);
-        para.lines.push(content);
-        para.el = i;
-        lastLineBlank = false;
-        continue;
+        if (para.over && failedType === 'item') {
+          // Fall through to the close-containers path below.
+        } else if (failedType === 'item' && para.prevStripped && paraParent && paraParent.t === 'bq') {
+          // The paragraph belongs to a blockquote inside the failed
+          // item, and the previous line stripped 4 (a lazy line that
+          // lost 4 columns, or a matched over-indented line): a further
+          // line outside the item ends the item instead of lazily
+          // continuing that paragraph. (Probed: '- a\n  > b\n
+          // c\nd' puts 'd' at top level, while the same shape with an
+          // unstripped previous line keeps it in the blockquote, and a
+          // plain item paragraph keeps a lazy line after a strip.)
+          // Fall through to the close-containers path below.
+        } else if (para.over && failedType === 'bq' && paraParent && paraParent.t === 'item') {
+          closeTo(failedIdx + 1);
+          startBlockLoop(line, i, cur, pad);
+          lastLineBlank = false;
+          continue;
+        } else {
+          const container = stack[failedIdx];
+          let effLine = ' '.repeat(pad) + line.slice(cur.pos);
+          let effCol = cur.col - pad;
+          // When the paragraph belongs to a nested item, a line lazy
+          // for an outer item is kept verbatim in that item's text and
+          // only loses the nested items' relative indent (innermost
+          // contentIndent - failed contentIndent), not a flat 4
+          // (probed: B doc-05 '     Image...' keeps 3 spaces).
+          let innerItem = null;
+          if (failedType === 'item') {
+            for (let j = stack.length - 2; j > failedIdx; j--) {
+              if (stack[j].t === 'item') { innerItem = stack[j]; break; }
+            }
+            if (innerItem) {
+              const dedent = innerItem.contentIndent - container.contentIndent;
+              // Only strip the nested items' relative indent when the
+              // line actually has that much indent left (after the
+              // matched containers were stripped). A line that is
+              // under-indented for the inner item keeps its remaining
+              // indent as a lazy line (probed: '- a\n  - b\n      - c\n
+              //    plain' keeps ' plain', it must not lose its 1 space
+              // to a 4-column dedent).
+              if (dedent > 0 && indentOf(effLine, 0, effCol).cols >= dedent) {
+                const cc = { pos: 0, col: effCol };
+                const pd = advanceCols(effLine, cc, dedent);
+                effLine = ' '.repeat(pd) + effLine.slice(cc.pos);
+                effCol = cc.col - pd;
+              }
+            }
+          }
+          // A previous line that stripped 4 splits the paragraph when
+          // this line is under-indented; otherwise it continues plain.
+          if (para.prevStripped && indentOf(effLine, 0, effCol).cols < 4) {
+            para.lines.push('');
+          }
+          let content;
+          if (failedType === 'bq') {
+            content = lazyBqContent(effLine, effCol, para);
+            para.prevStripped = para.lazy && para.lazyStrip === 4;
+          } else if (innerItem) {
+            // The line is now in the innermost item's text; only the
+            // paragraph-level strip applies (4 columns when
+            // over-indented in an item paragraph, skipped after a
+            // nested list), mirroring a matched continuation line.
+            content = effLine;
+            const parentIsItem2 = paraParent && paraParent.t === 'item';
+            let afterList2 = false;
+            if (parentIsItem2) {
+              for (const c of paraParent.ch) {
+                if (c === para) break;
+                if (c.t === 'list') { afterList2 = true; break; }
+              }
+            }
+            const ind2 = indentOf(effLine, 0, effCol);
+            if (parentIsItem2 && ind2.cols >= 4 && !afterList2) {
+              const cc = { pos: 0, col: effCol };
+              const pd = advanceCols(effLine, cc, 4);
+              content = ' '.repeat(pd) + effLine.slice(cc.pos);
+              para.prevStripped = true;
+            } else {
+              para.prevStripped = false;
+            }
+          } else {
+            content = lazyItemContent(effLine, effCol, container);
+            // A lazy line is under-indented for its item by definition
+            // (it failed the item's indent), so it never leaves the
+            // paragraph over-indented — but it DOES strip 4 when its
+            // own indent is >= 4, and that strip marks the next line
+            // for a split (probed: '119293. a\n     b\nc' splits).
+            para.prevStripped = indentOf(effLine, 0, effCol).cols >= 4;
+          }
+          para.over = false;
+          para.lines.push(content);
+          para.el = i;
+          lastLineBlank = false;
+          continue;
+        }
       }
       // Not lazy: close containers from the failed one up. A failed item
       // whose line starts a matching new item keeps its list open.
@@ -917,6 +1084,7 @@ function parseBlocks(src, refs) {
           closeTo(failedIdx); // pop item (and leaf) only, keep the list
           const item = newBlock('item', i);
           item.contentIndent = lm.contentIndent;
+          item.markerCol = lm.markerCol;
           item.baseCol = cur.col;
           addChild(list, item);
           stack.push(item);
@@ -988,6 +1156,7 @@ function parseBlocks(src, refs) {
         const cc = { pos: 0, col: cur.col - pad };
         t.lines.push(stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0));
         t.el = i;
+        lastLineBlank = true;
       }
       else if (t && t.t === 'code') {
         // A blank line inside a code block keeps its content past the
@@ -1068,7 +1237,66 @@ function parseBlocks(src, refs) {
           continue;
         }
       }
-      t.lines.push(expandLeadingTabs(' '.repeat(pad) + line.slice(cur.pos), cur.col - pad));
+      // A paragraph continuation line inside a list item loses 4 more
+      // columns when at least 4 remain after the container strips
+      // (probed: '- a\n      b' keeps 'b', '- a\n    b' keeps '  b';
+      // top-level and blockquote paragraphs keep their indent whole).
+      // A paragraph that follows a nested list in its item renders
+      // with <p> and skips the extra strip (probed: '- a\n  - x\n
+      // # h\n  b\n      c' keeps '    c'); only a direct list child
+      // counts. An over-indented line ends the paragraph for the next
+      // line: the next line splits it by an empty line in its text
+      // (marked renders '\n\n' inside the same paragraph).
+      let effLine = ' '.repeat(pad) + line.slice(cur.pos);
+      let effCol = cur.col - pad;
+      const parent = stack.length >= 2 ? stack[stack.length - 2] : null;
+      const parentIsItem = parent && parent.t === 'item';
+      let afterList = false;
+      if (parentIsItem) {
+        for (const c of parent.ch) {
+          if (c === t) break;
+          if (c.t === 'list') { afterList = true; break; }
+        }
+      }
+      if (parentIsItem) {
+        const ind = indentOf(effLine, 0, effCol);
+        if (ind.cols >= 4) {
+          t.over = true;
+          if (!afterList) {
+            const cc = { pos: 0, col: effCol };
+            const pd = advanceCols(effLine, cc, 4);
+            effLine = ' '.repeat(pd) + effLine.slice(cc.pos);
+            effCol = cc.col - pd;
+            t.prevStripped = true;
+          } else {
+            t.prevStripped = false;
+          }
+        } else {
+          if (t.prevStripped) t.lines.push('');
+          t.over = false;
+          t.prevStripped = false;
+        }
+      } else {
+        const ind = indentOf(effLine, 0, effCol);
+        if (t.prevStripped && ind.cols < 4) t.lines.push('');
+        t.prevStripped = false;
+      }
+      // A line that starts with a fence marker (``` or ~~~) but is not
+      // a real fence (its info holds a backtick, or it closes on the
+      // same line) ends lazy continuation: the next lazy line is not
+      // accepted (probed: '807218. text.\n        ```code```\nfor deno
+      // removes' puts 'for deno removes' outside the list, while a
+      // plain indented line or a single-backtick code span does not).
+      {
+        const ind = indentOf(effLine, 0, effCol);
+        const p = ind.pos;
+        t.afterFenceLike = ind.cols <= 3 && p < effLine.length &&
+          ((effLine[p] === '`' && effLine.slice(p, p + 3) === '```') ||
+           (effLine[p] === '~' && effLine.slice(p, p + 3) === '~~~'));
+      }
+      // A top-level paragraph keeps leading tabs verbatim (probed:
+      // 'a\n\tb' keeps the tab); inside a container they expand.
+      t.lines.push(parent && parent.t === 'doc' ? effLine : expandLeadingTabs(effLine, effCol));
       t.el = i; t.lazy = false;
       lastLineBlank = false;
       continue;
@@ -1079,7 +1307,21 @@ function parseBlocks(src, refs) {
         // Strip up to the fence's own indent from the content line.
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const cc = { pos: 0, col: cur.col - pad };
-        t.lines.push(stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0));
+        const content = stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0);
+        // Once a fence's content holds a fence-like line (a line
+        // starting with ``` or ~~~), the fence stops absorbing lines
+        // that fail the item (probed: '- a\n  ```\n  ```inner```\n
+        // plain' puts 'plain' outside the list). A plain content
+        // line clears it again (a matched line after the fence-like
+        // line lets the following failing line be absorbed).
+        {
+          const ind = indentOf(content, 0, 0);
+          const p = ind.pos;
+          t.afterFenceLike = ind.cols <= 3 && p < content.length &&
+            ((content[p] === '`' && content.slice(p, p + 3) === '```') ||
+             (content[p] === '~' && content.slice(p, p + 3) === '~~~'));
+        }
+        t.lines.push(content);
         t.el = i;
       }
       lastLineBlank = false;
@@ -1114,6 +1356,7 @@ function parseBlocks(src, refs) {
     lastLineBlank = false;
   }
   closeTo(1);
+  trimListTails(root);
   root.blankSet = blankSet;
   root.emptySet = emptySet;
   root.totalLines = lines.length;
@@ -1666,6 +1909,11 @@ function scanInline(s, refs, allowAuto) {
       let j = i;
       while (j < n && s[j] === '~') j++;
       const run = j - i;
+      // A '~' inside a phantom code span renders literally, like '*'
+      // and '_' (probed: '[in ``update`](#should) x\n~less~ tests\n
+      // `code` y' keeps '~less~' literal: the lone backtick at the
+      // end of the label pairs with the '`' opening 'code').
+      if (suppress.length && isSuppressed(i)) { buf += '~'.repeat(run); i = j; continue; }
       if (run === 1 || run === 2) {
         const prev = i > 0 ? s[i - 1] : '';
         const next = j < n ? s[j] : '';
@@ -2280,13 +2528,24 @@ function renderBlock(b, refs, blankSet, emptySet) {
 function renderItem(item, refs, blankSet, loose, emptySet) {
   let out = '<li>';
   const ch = item.ch;
+  // A paragraph after a nested list renders with <p> even in a tight
+  // list (probed: '- a\n  - x\n  # h\n  b' wraps 'b'); other tight
+  // paragraphs render bare. Only a direct list child counts.
+  let seenList = false;
   for (let i = 0; i < ch.length; i++) {
     const c = ch[i];
+    if (c.t === 'list') seenList = true;
     if (c.t === 'para' && !c.dead) {
-      if (loose) {
+      if (loose || seenList) {
         out += '<p>' + renderParaText(c, refs, i === 0) + '</p>\n';
       } else {
         out += renderParaText(c, refs, i === 0);
+        // A bare paragraph whose last line stripped 4 takes a trailing
+        // newline when another block follows it inside the item
+        // (probed: '* a\n\t indented four\n > not a quote' keeps '\n'
+        // after the paragraph text; with an unstripped last line, or
+        // with no block following, there is no '\n').
+        if (c.prevStripped && ch.slice(i + 1).some(x => !x.dead)) out += '\n';
       }
     } else if (!c.dead) {
       out += renderBlock(c, refs, blankSet, emptySet);
@@ -2296,6 +2555,14 @@ function renderItem(item, refs, blankSet, loose, emptySet) {
       if (c.t === 'html' && ch.slice(i + 1).some(x => !x.dead)) {
         const term = c.htype === 6 ? blankSet : emptySet;
         if (!term.has(c.el + 1)) out += '\n';
+      } else if (c.t === 'html' && emptySet.has(c.el + 1)) {
+        // An HTML block also takes a trailing newline when a truly
+        // empty line follows it and no other block follows inside the
+        // item (probed: type-2 comment and type-6 div both take '\n'
+        // when an empty line follows and a new item starts after it).
+        // A blockquote-only blank line ('>') does not count: it is in
+        // blankSet but not emptySet (practice doc-30).
+        out += '\n';
       }
     }
   }
