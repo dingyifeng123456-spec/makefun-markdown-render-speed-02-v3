@@ -950,6 +950,19 @@ function parseBlocks(src, refs) {
       // <ol> in the outer blockquote after the inner one ends).
       const isListMarker = listMarker(line, cur.pos, cur.col);
       const paraParent = stack.length >= 2 ? stack[stack.length - 2] : null;
+      // A fence-like line (starting with ``` or ~~~) is never a lazy
+      // continuation either: it starts a new block outside the item
+      // (probed: '  - not a list item\n  ```inner backticks```' puts
+      // the fence-like line in a top-level paragraph, while the same
+      // line matching the item stays inside it).
+      const isFenceLike = (() => {
+        const ind = indentOf(line, cur.pos, cur.col);
+        if (ind.cols > 3) return false;
+        const p = ind.pos;
+        return p < line.length &&
+          ((line[p] === '`' && line.slice(p, p + 3) === '```') ||
+           (line[p] === '~' && line.slice(p, p + 3) === '~~~'));
+      })();
       // Lazy-continuation depth limit: a line that fails the outermost
       // list item is not a lazy continuation of a paragraph whose
       // item's marker sits at column 6 or more (probed: doc-12;
@@ -967,7 +980,7 @@ function parseBlocks(src, refs) {
         for (let j = 0; j < stack.length; j++) { if (stack[j].t === 'item') { outermostItemIdx = j; break; } }
         if (paraItem && outermostItemIdx >= 0 && failedIdx === outermostItemIdx && (paraItem.markerCol ?? 0) >= 6) tooDeepToBeLazy = true;
       }
-      if (lazyOk && !isListMarker && !tooDeepToBeLazy && !(t.afterFenceLike && failedType === 'item') && !interruptsPara(line, cur.pos, cur.col, paraParent && paraParent.t === 'item')) {
+      if (lazyOk && !isListMarker && !(isFenceLike && failedType === 'item') && !tooDeepToBeLazy && !(t.afterFenceLike && failedType === 'item') && !interruptsPara(line, cur.pos, cur.col, paraParent && paraParent.t === 'item')) {
         // Lazy continuation line: the content is the line after the
         // containers that did match. But after an over-indented line
         // (para.over) a line that fails the item is not lazy at all —
@@ -1817,17 +1830,35 @@ function scanInline(s, refs, allowAuto) {
   // search for a closing run does not skip escaped backticks, so the
   // phantom pairing must not skip them either, or it pairs one span
   // too late and suppresses the wrong range (doc-06).
+  // But a backtick inside a REFERENCE link's label does not pair at
+  // all: marked does not suppress the emphasis after a reference link
+  // (probed: '[a ``b`][r] text\n*em* more\n`code` y' keeps '<em>em</em>',
+  // while the same shape with an inline link '[a ``b`](x)' suppresses
+  // it). So reference-label ranges are excluded from the pairing, as
+  // openers and as closers.
+  const refLabelRanges = [];
+  {
+    let q = 0;
+    while (q < n) {
+      if (s[q] === '[') {
+        const label = parseLabel(s, q);
+        if (label && s[label.end] === '[') refLabelRanges.push([q, label.end]);
+        q = label ? label.end : q + 1;
+      } else q++;
+    }
+  }
+  const inRefLabel = (pos) => { for (let q = 0; q < refLabelRanges.length; q++) { const r = refLabelRanges[q]; if (pos >= r[0] && pos < r[1]) return true; } return false; };
   {
     let p = 0;
     const isEsc = (pos) => { let b = 0; for (let q = pos - 1; q >= 0 && s[q] === '\\'; q--) b++; return b % 2 === 1; };
     while (p < n) {
-      if (s[p] === '`' && !isEsc(p)) {
+      if (s[p] === '`' && !isEsc(p) && !inRefLabel(p)) {
         let q = p;
         while (q < n && s[q] === '`') q++;
         const run = q - p;
         let k = q, found = -1;
         while (k < n) {
-          if (s[k] === '`') {
+          if (s[k] === '`' && !inRefLabel(k)) {
             let e = k;
             while (e < n && s[e] === '`') e++;
             if (e - k === run) { found = k; break; }
