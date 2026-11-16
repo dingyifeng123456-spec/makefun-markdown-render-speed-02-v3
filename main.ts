@@ -20,6 +20,13 @@ function isUnicodePunct(ch) {
   if (isPunct(ch)) return true;
   return UNICODE_PUNCT_RE.test(ch);
 }
+// '~' counts as punctuation when it FOLLOWS a delimiter run, but not
+// when it PRECEDES one (marked): a run preceded by '~' and followed by
+// punctuation is closer-only ('**a b~****' forms the strong), while a
+// '_' closer followed by '~' still closes ('a _line_~ b' forms the em).
+function isUnicodePunctPrev(ch) {
+  return ch !== '~' && isUnicodePunct(ch);
+}
 function isWhitespaceChar(ch) {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v' || ch === '\u00a0' || ch === '\u1680' || (ch >= '\u2000' && ch <= '\u200a') || ch === '\u2028' || ch === '\u2029' || ch === '\u202f' || ch === '\u205f' || ch === '\u3000' || ch === '\ufeff';
 }
@@ -527,7 +534,12 @@ function lazyBqContent(line, col, para) {
 // once when the excess is at least 4.
 function lazyItemContent(line, col, item) {
   const ind = indentOf(line, 0, col);
-  const ci = item.contentIndent - col;
+  // The item's content indent, relative to the container-stripped
+  // position where the item was opened (see item.baseCol): a '>'
+  // marker followed by an optional space strips a different number of
+  // columns on different lines, so the absolute contentIndent cannot
+  // be compared against this line's indent directly.
+  const ci = item.contentIndent - (item.baseCol ?? col);
   if (ind.cols < ci) {
     // Lazy line: an indent of 4+ columns loses 4 columns; a smaller
     // indent is kept verbatim.
@@ -700,7 +712,10 @@ function parseBlocks(src, refs) {
       const fs = fenceStart(line, cur.pos, cur.col);
       if (fs) {
         const f = newBlock('fence', i); f.fch = fs.ch; f.len = fs.len; f.info = fs.info; f.lines = [];
-        f.indent = indentOf(line, cur.pos, cur.col).cols;
+        // marked strips the opening fence's indent from content lines
+        // only for backtick fences; a tilde fence keeps its content's
+        // indentation (probed against the house baseline).
+        f.indent = fs.ch === '~' ? 0 : indentOf(line, cur.pos, cur.col).cols;
         addChild(top(), f); stack.push(f);
         return;
       }
@@ -733,6 +748,7 @@ function parseBlocks(src, refs) {
         }
         const item = newBlock('item', i);
         item.contentIndent = lm.contentIndent;
+        item.baseCol = cur.col;
         addChild(list, item);
         stack.push(item);
         if (lm.empty) return;
@@ -823,9 +839,15 @@ function parseBlocks(src, refs) {
       } else if (b.t === 'item') {
         segBase = cur.col;
         const ind = indentOf(line, cur.pos, cur.col);
-        const required = b.contentIndent - cur.col;
-        if (ind.cols < required) { failedIdx = s; failedType = 'item'; break; }
-        pad = advanceCols(line, cur, required);
+        // Relative content indent: the item's content sits
+        // (contentIndent - baseCol) columns past the container-stripped
+        // position where the item opened, not at the absolute column.
+        // `pad` (leftover columns of a tab partly consumed by an outer
+        // container) counts toward the indent available on this line,
+        // and is consumed first when advancing past the content indent.
+        const required = b.contentIndent - (b.baseCol ?? cur.col);
+        if (pad + ind.cols < required) { failedIdx = s; failedType = 'item'; break; }
+        pad = (required <= pad ? pad - required : 0) + advanceCols(line, cur, Math.max(0, required - pad));
       }
     }
 
@@ -836,8 +858,19 @@ function parseBlocks(src, refs) {
       // unless the line is a closing fence for it (which must match).
       // But the fence's first content line must match the item: if the
       // fence is still empty, an unindented line ends the fence (and the
-      // item) instead of being absorbed.
-      if (t && t.t === 'fence' && failedType === 'item' && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
+      // item) instead of being absorbed. And if a blockquote sits
+      // between the failed item and the fence, the line cannot be fence
+      // content at all: it fails the item's indent, so its first
+      // non-space character falls before the item's content column,
+      // where the blockquote's marker would have to sit — the line is
+      // outside the blockquote, hence outside the fence (doc-36: the
+      // '~~~~' fence inside a blockquote ends when the next list item
+      // starts, instead of swallowing it as code).
+      let bqBetween = false;
+      for (let si = failedIdx + 1; si < stack.length - 1; si++) {
+        if (stack[si].t === 'bq') { bqBetween = true; break; }
+      }
+      if (t && t.t === 'fence' && failedType === 'item' && !bqBetween && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const cc = { pos: 0, col: cur.col - pad };
         t.lines.push(stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0));
@@ -884,6 +917,7 @@ function parseBlocks(src, refs) {
           closeTo(failedIdx); // pop item (and leaf) only, keep the list
           const item = newBlock('item', i);
           item.contentIndent = lm.contentIndent;
+          item.baseCol = cur.col;
           addChild(list, item);
           stack.push(item);
           if (!lm.empty) {
@@ -1001,10 +1035,38 @@ function parseBlocks(src, refs) {
         // Not a heading: the line is paragraph text.
       }
       if (interruptsPara(line, cur.pos, cur.col, stack.length >= 2 && stack[stack.length - 2].t === 'item')) {
+        // A table delimiter row does not interrupt the paragraph as a
+        // list: '- | ---- | :-:' starts with a bullet marker but
+        // completes the table (the paragraph has only its header line
+        // so far and this line is a delimiter row of the same width).
+        if (t.lines.length === 1) {
+          const eff = expandLeadingTabs(' '.repeat(pad) + line.slice(cur.pos), cur.col - pad);
+          const delim = parseDelimRow(eff);
+          if (delim && splitTableRow(t.lines[0]).length === delim.length &&
+              (t.lines[0].indexOf('|') >= 0 || eff.indexOf('|') >= 0)) {
+            t.lines.push(eff);
+            t.el = i; t.lazy = false;
+            lastLineBlank = false;
+            continue;
+          }
+        }
         finalizeTop();
         startBlockLoop(line, i, cur, pad);
         lastLineBlank = false;
         continue;
+      }
+      // A table paragraph does not absorb a line indented 4 or more
+      // columns: the table ends there and the line starts an indented
+      // code block instead (a row at 0-3 columns, piped or not, still
+      // belongs to the table).
+      if (paraIsTable(t)) {
+        const ind = indentOf(line, cur.pos, cur.col);
+        if (pad + ind.cols >= 4) {
+          finalizeTop();
+          startBlockLoop(line, i, cur, pad);
+          lastLineBlank = false;
+          continue;
+        }
       }
       t.lines.push(expandLeadingTabs(' '.repeat(pad) + line.slice(cur.pos), cur.col - pad));
       t.el = i; t.lazy = false;
@@ -1305,6 +1367,56 @@ function escChar(c) {
   return c;
 }
 
+// Earliest delimiter run inside a scanned URL span that can close an
+// unmatched opener of the same character in the tokens emitted so far,
+// or -1. An extended autolink ends before such a run: the run closes
+// the emphasis/del the URL sits in ('~~foo https://x/path.~~' links
+// only 'https://x/path', the '.' trimmed after the cut), while a run
+// that cannot close the opener (rule of three, or '~' lengths differ)
+// stays part of the URL ('*bar https://x/path**foo' keeps '**foo').
+function urlDelimCut(s, from, to, out) {
+  for (let p = from; p < to; p++) {
+    const c = s[p];
+    if (c !== '*' && c !== '_' && c !== '~') continue;
+    let q = p;
+    while (q < to && s[q] === c) q++;
+    const run = q - p;
+    if (c === '~' && run !== 1 && run !== 2) { p = q - 1; continue; }
+    const prev = p > 0 ? s[p - 1] : '';
+    const next = q < s.length ? s[q] : '';
+    const prevWs = prev === '' || isWhitespaceChar(prev);
+    const nextWs = next === '' || isWhitespaceChar(next);
+    const prevPunct = prev !== '' && isUnicodePunctPrev(prev);
+    const nextPunct = next !== '' && isUnicodePunct(next);
+    const leftFlank = !nextWs && (!nextPunct || prevWs || prevPunct);
+    const rightFlank = !prevWs && (!prevPunct || nextWs || nextPunct);
+    let canOpen, canClose;
+    if (c === '*') { canOpen = leftFlank; canClose = rightFlank; }
+    else if (c === '_') { canOpen = leftFlank && (!rightFlank || prevPunct); canClose = rightFlank && (!leftFlank || nextPunct); }
+    else { canOpen = leftFlank; canClose = rightFlank; }
+    if (!canClose) { p = q - 1; continue; }
+    // Unmatched openers of this character among the emitted tokens
+    // (same stack simulation as the email delimiter exception).
+    const stack = [];
+    for (const t of out) {
+      if (t.k !== 'delim' || t.ch !== c || t.len === 0) continue;
+      if (t.canOpen && !t.canClose) stack.push(t);
+      else if (t.canClose && !t.canOpen) { if (stack.length) stack.pop(); }
+      else if (t.canOpen && t.canClose) { if (stack.length) stack.pop(); else stack.push(t); }
+    }
+    for (const op of stack) {
+      if (c === '~' && op.len !== run) continue;
+      // Rule of three: applies when either side can both open and
+      // close (the run's both-ness is its own canOpen && canClose).
+      if (((op.canOpen && op.canClose) || (canOpen && canClose)) &&
+          (op.len + run) % 3 === 0 && !(op.len % 3 === 0 && run % 3 === 0)) continue;
+      return p;
+    }
+    p = q - 1;
+  }
+  return -1;
+}
+
 // Scan a URL (autolink) starting at j. Stops at whitespace, < > " ' `,
 // control chars, or an entity reference. Parens are included verbatim;
 // trailing unbalanced ')' is trimmed by trimAutolink.
@@ -1456,9 +1568,12 @@ function scanInline(s, refs, allowAuto) {
   // Phantom code spans: pair backtick runs over the raw string s the way
   // the code-span branch does, ignoring link structure. A span that opens
   // inside a link label and closes after it still suppresses emphasis
-  // delimiters between the link and its closing run in marked. Escaped
-  // backticks (preceded by an odd run of backslashes) are literal text
-  // and never open a span.
+  // delimiters between the link and its closing run in marked. An
+  // escaped backtick never *opens* a span (the backslash branch consumes
+  // it first), but it can still *close* one: the code-span branch's
+  // search for a closing run does not skip escaped backticks, so the
+  // phantom pairing must not skip them either, or it pairs one span
+  // too late and suppresses the wrong range (doc-06).
   {
     let p = 0;
     const isEsc = (pos) => { let b = 0; for (let q = pos - 1; q >= 0 && s[q] === '\\'; q--) b++; return b % 2 === 1; };
@@ -1469,7 +1584,7 @@ function scanInline(s, refs, allowAuto) {
         const run = q - p;
         let k = q, found = -1;
         while (k < n) {
-          if (s[k] === '`' && !isEsc(k)) {
+          if (s[k] === '`') {
             let e = k;
             while (e < n && s[e] === '`') e++;
             if (e - k === run) { found = k; break; }
@@ -1536,7 +1651,7 @@ function scanInline(s, refs, allowAuto) {
       const next = j < n ? s[j] : '';
       const prevWs = prev === '' || isWhitespaceChar(prev);
       const nextWs = next === '' || isWhitespaceChar(next);
-      const prevPunct = prev !== '' && isUnicodePunct(prev);
+      const prevPunct = prev !== '' && isUnicodePunctPrev(prev);
       const nextPunct = next !== '' && isUnicodePunct(next);
       const leftFlank = !nextWs && (!nextPunct || prevWs || prevPunct);
       const rightFlank = !prevWs && (!prevPunct || nextWs || nextPunct);
@@ -1556,7 +1671,7 @@ function scanInline(s, refs, allowAuto) {
         const next = j < n ? s[j] : '';
         const prevWs = prev === '' || isWhitespaceChar(prev);
         const nextWs = next === '' || isWhitespaceChar(next);
-        const prevPunct = prev !== '' && isUnicodePunct(prev);
+        const prevPunct = prev !== '' && isUnicodePunctPrev(prev);
         const nextPunct = next !== '' && isUnicodePunct(next);
         const leftFlank = !nextWs && (!nextPunct || prevWs || prevPunct);
         const rightFlank = !prevWs && (!prevPunct || nextWs || nextPunct);
@@ -1753,8 +1868,11 @@ function scanInline(s, refs, allowAuto) {
             if (j < n && s[j] === '.' && isFirst) { ends.push(j); pos = j + 1; continue; }
             if (j < n && s[j] === '.') {
               // A non-first label ending in '_'/'-' before a dot is
-              // invalid: the domain ends before this label.
-              if (e < j) break;
+              // invalid as a whole, but its trimmed end is still a
+              // candidate domain end: the delimiter exception below
+              // needs it (a '__' closer after 'com' ends the email
+              // at 'com' when an unmatched '__' opener precedes it).
+              if (e < j) { if (e > pos) ends.push(e); break; }
               ends.push(e); pos = j + 1;
               if (pos >= n || !isAlnum(s[pos])) break;
               continue;
@@ -1776,7 +1894,7 @@ function scanInline(s, refs, allowAuto) {
               const prev = s[fullEnd - 1];
               const nextWs = nx === '' || isWhitespaceChar(nx);
               const nextPunct = nx !== '' && isUnicodePunct(nx);
-              const prevPunct = isUnicodePunct(prev);
+              const prevPunct = isUnicodePunctPrev(prev);
               const leftFlank = !nextWs && (!nextPunct || prev === '' || isWhitespaceChar(prev) || prevPunct);
               const rightFlank = prev !== '' && !isWhitespaceChar(prev) && (!prevPunct || nextWs || nextPunct);
               const canClose = rightFlank && (!leftFlank || nextPunct);
@@ -1845,7 +1963,8 @@ function scanInline(s, refs, allowAuto) {
     if (allowAuto && !refs.inLink && ch === 'w' && s.startsWith('www.', i) && autolinkAllowed(s, i, out, buf)) {
       const r = scanUrl(s, i + 4);
       if (r.end > i + 4) {
-        const text = trimAutolink(s.slice(i, r.end));
+        const cut = urlDelimCut(s, i + 4, r.end, out);
+        const text = trimAutolink(s.slice(i, cut >= 0 ? cut : r.end));
         if (text.length > 4) {
           flush();
           out.push({ k: 'link', auto: true, href: 'http://' + cleanUrlRaw(text), title: null, ch: [{ k: 't', s: escapeText(text) }] });
@@ -1863,7 +1982,8 @@ function scanInline(s, refs, allowAuto) {
       if (scheme !== null) {
         const r = scanUrl(s, i + scheme);
         if (r.end > i + scheme) {
-          const text = trimAutolink(s.slice(i, r.end));
+          const cut = urlDelimCut(s, i + scheme, r.end, out);
+          const text = trimAutolink(s.slice(i, cut >= 0 ? cut : r.end));
           if (text.length > scheme) {
             flush();
             out.push({ k: 'link', auto: true, href: cleanUrlRaw(text), title: null, ch: [{ k: 't', s: escapeText(text) }] });
@@ -1890,33 +2010,49 @@ function scanInline(s, refs, allowAuto) {
   return out;
 }
 
-// Resolve emphasis / strong / strikethrough delimiters (CommonMark
-// delimiter-stack algorithm, with the rule of three). A closer that can
-// also open ("both" delimiter), when consumed, raises a barrier: the
-// immediately following closer may not use an opener before the node just
-// created when that opener is at least as long as the closer (so a lone
-// '*' may still close a '**' opener). The barrier is lifted once that
-// closer is processed.
+// Resolve emphasis / strong / strikethrough delimiters. Single pass,
+// left to right (CommonMark-style): each delimiter is visited once as
+// a potential closer, so a closer that fails can never be revived by a
+// later match. A closer that can also open ("both" delimiter), when
+// consumed, raises a barrier for its character: a later closer may not
+// use an opener before the created node. Whether it may is decided by
+// the use the match would take (fitted against the house baseline):
+//   use 1 is allowed iff the closer run has length 3, or the opener is
+//     a lone '*' and the barrier closer was a lone '*' too;
+//   use 2 is allowed iff the closer run has length 3 and the opener is
+//     at most one longer than the barrier closer, or the opener and
+//     closer runs are both exactly as long as the barrier closer.
+// A match that consumes a leftover of the barrier run itself is exempt
+// from the barrier and clears it (that is how '***q***' splits into
+// <em><strong>q</strong></em> and still lets an outer '*' close).
+// While a barrier is active, a match's leftover delimiter runs land
+// inside the created node when the opener run differs in length from
+// the barrier closer, and outside it otherwise.
 function resolveDelimiters(tokens) {
-  // barrier: {node, ch, closerLen, openerCanClose} of the most recent
-  // match whose closer could also open. It only bars openers of the
-  // same character (a '~~' match must not bar a '_' opener).
-  let barrier = null;
+  const barriers = new Map(); // ch -> {node, closerLen, openerCanClose}
   while (true) {
     let matched = false;
     for (let ci = 0; ci < tokens.length; ci++) {
       const closer = tokens[ci];
       if (closer.k !== 'delim' || closer.len === 0 || !closer.canClose) continue;
-      const barrierIdx = (barrier && barrier.ch === closer.ch) ? tokens.indexOf(barrier.node) : -1;
+      const barrier = barriers.get(closer.ch) || null;
+      const barrierIdx = barrier ? tokens.indexOf(barrier.node) : -1;
       let found = false;
       for (let oi = ci - 1; oi >= 0; oi--) {
         const opener = tokens[oi];
         if (opener.k !== 'delim' || opener.len === 0 || opener.ch !== closer.ch || !opener.canOpen) continue;
         // Blocked by the barrier (see comment above): an opener before
         // the barrier node is barred when it is longer than this closer
-        // or shorter than the barrier-creating closer's run.
+        // or shorter than the barrier-creating closer's run. A closer
+        // that is itself the leftover of the barrier run is exempt:
+        // it is the same run finishing, not a new closer reaching back
+        // (doc-19: the '*' left over from '***' still closes '*then').
+        // A closer run of length 3 is also exempt from the shortness
+        // bar: it spans the barrier and the outer match at once
+        // ('*a **b**c***' still forms the outer em).
         if (barrierIdx >= 0 && oi < barrierIdx && !barrier.openerCanClose &&
-            (opener.len > closer.len || opener.len < barrier.closerLen)) continue;
+            closer !== barrier.run &&
+            (opener.len > closer.len || (opener.len < barrier.closerLen && closer.len < 3))) continue;
         // Strikethrough delimiters only match when the runs have the
         // same length (1 with 1, 2 with 2).
         if (closer.ch === '~' && opener.len !== closer.len) continue;
@@ -1931,21 +2067,46 @@ function resolveDelimiters(tokens) {
         const children = tokens.slice(oi + 1, ci);
         const node = { k: kind, ch: children };
         const closerBoth = closer.canOpen && closer.canClose;
-        tokens.splice(oi, ci - oi + 1, node);
+        const oLen = opener.len, cLen = closer.len;
+        // Leftover runs go inside the node when a barrier for this
+        // character is active over an opener before it whose run
+        // differs in length from the barrier closer's run. Only when
+        // the opener is a complete run (not a leftover of an earlier
+        // match): a leftover opener must stay outside so a later match
+        // can still consume it (cm-417: '******'/'*********' nest into
+        // three strongs; pulling leftovers inside breaks the nesting).
+        // A leftover closer does not block it ('**build an an *value
+        // *call*directory****' ends 'directory*</strong>'). And only
+        // when the barrier itself was set by a match of complete
+        // runs: a barrier set by a leftover match leaves its leftover
+        // outside ('**a ***b***c***' ends '</strong>*', while
+        // '**return that *old*two***' ends 'two*</strong>').
+        const inside = barrierIdx >= 0 && oi < barrierIdx && oLen !== barrier.closerLen &&
+          !opener.partial && !barrier.run.partial;
         opener.len -= use; closer.len -= use;
+        if (opener.len > 0) opener.partial = true;
+        if (closer.len > 0) closer.partial = true;
+        if (inside) {
+          if (opener.len > 0) node.ch.unshift({ k: 't', s: opener.ch.repeat(opener.len) });
+          if (closer.len > 0) node.ch.push({ k: 't', s: closer.ch.repeat(closer.len) });
+          opener.len = 0; closer.len = 0;
+        }
+        // A barrier node absorbed as a child of the new node is
+        // re-anchored on the new node so it keeps barring.
+        for (const b of barriers.values()) {
+          if (b.node !== node && children.indexOf(b.node) >= 0) b.node = node;
+        }
+        tokens.splice(oi, ci - oi + 1, node);
         if (opener.len > 0) tokens.splice(oi, 0, opener);
         const nodeIdx = oi + (opener.len > 0 ? 1 : 0);
         if (closer.len > 0) tokens.splice(nodeIdx + 1, 0, closer);
-        barrier = closerBoth ? { node, ch: closer.ch, closerLen: closer.len + use, openerCanClose: opener.canOpen && opener.canClose } : null;
+        if (closerBoth) barriers.set(closer.ch, { node, closerLen: cLen, openerCanClose: opener.canOpen && opener.canClose, run: closer });
         matched = true;
         found = true;
         break;
       }
       if (matched) break;
-      // A closer that found no opener does NOT clear the barrier:
-      // the barrier must still bar pre-node openers for later closers
-      // (doc-11: the '*' after 'parse' fails, yet the final '**' must
-      // still skip the '*' opener and use the '**' opener).
+      // A closer that found no opener does NOT clear the barrier.
     }
     if (!matched) break;
   }
