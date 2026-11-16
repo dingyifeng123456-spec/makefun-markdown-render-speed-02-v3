@@ -815,7 +815,11 @@ function parseBlocks(src, refs) {
         continue;
       }
       // Indented code: the effective line (container pad + rest) must be
-      // indented by 4 columns; strip exactly 4.
+      // indented by 4 columns; strip exactly 4. Inside a container
+      // (a list item), a leading tab left after the strip expands to
+      // spaces (probed: a code line '\t      \tindented' inside a list
+      // item gives 3 leading spaces). At the top level the tab stays
+      // literal (probed: '    \tindented' keeps the tab).
       {
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const effCol = cur.col - pad;
@@ -824,7 +828,8 @@ function parseBlocks(src, refs) {
           const code = newBlock('code', i); code.lines = [];
           const cc = { pos: 0, col: effCol };
           const pd = advanceCols(eff, cc, 4);
-          code.lines.push(' '.repeat(pd) + eff.slice(cc.pos));
+          const raw = ' '.repeat(pd) + eff.slice(cc.pos);
+          code.lines.push(top().t !== 'doc' ? expandLeadingTabs(raw, cc.col - pd) : raw);
           code.el = i;
           addChild(top(), code);
           stack.push(code);
@@ -914,7 +919,7 @@ function parseBlocks(src, refs) {
       for (let si = failedIdx + 1; si < stack.length - 1; si++) {
         if (stack[si].t === 'bq') { bqBetween = true; break; }
       }
-      if (t && t.t === 'fence' && failedType === 'item' && !bqBetween && !lastLineBlank && !t.afterFenceLike && !listMarker(line, cur.pos, cur.col) && !interruptsPara(line, cur.pos, cur.col, true) && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
+      if (t && t.t === 'fence' && failedType === 'item' && !bqBetween && !lastLineBlank && !t.afterFenceLike && !t.afterOverIndent && !listMarker(line, cur.pos, cur.col) && !interruptsPara(line, cur.pos, cur.col, true) && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const cc = { pos: 0, col: cur.col - pad };
         const content = stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0);
@@ -922,12 +927,18 @@ function parseBlocks(src, refs) {
         // the lines after it; a plain absorbed line clears it again
         // (probed: a matched '  -removed line' after the fence-like
         // line lets the following failing line be absorbed again).
+        // Likewise a content line that is over-indented after the
+        // fence indent is stripped (>= 4 leading columns) ends
+        // absorption for the next failing line (probed: a content
+        // line with 4 leading spaces lets a following definition
+        // escape the fence, while 3 or fewer keeps absorbing it).
         {
           const ind = indentOf(content, 0, 0);
           const p = ind.pos;
           t.afterFenceLike = ind.cols <= 3 && p < content.length &&
             ((content[p] === '`' && content.slice(p, p + 3) === '```') ||
              (content[p] === '~' && content.slice(p, p + 3) === '~~~'));
+          t.afterOverIndent = ind.cols >= 4;
         }
         t.lines.push(content);
         t.el = i;
@@ -1326,13 +1337,18 @@ function parseBlocks(src, refs) {
         // that fail the item (probed: '- a\n  ```\n  ```inner```\n
         // plain' puts 'plain' outside the list). A plain content
         // line clears it again (a matched line after the fence-like
-        // line lets the following failing line be absorbed).
+        // line lets the following failing line be absorbed). Likewise
+        // a content line over-indented after the fence indent is
+        // stripped (>= 4 leading columns) ends absorption for the
+        // next failing line (probed: content with 4 leading spaces
+        // lets a following definition escape the fence).
         {
           const ind = indentOf(content, 0, 0);
           const p = ind.pos;
           t.afterFenceLike = ind.cols <= 3 && p < content.length &&
             ((content[p] === '`' && content.slice(p, p + 3) === '```') ||
              (content[p] === '~' && content.slice(p, p + 3) === '~~~'));
+          t.afterOverIndent = ind.cols >= 4;
         }
         t.lines.push(content);
         t.el = i;
@@ -1347,7 +1363,14 @@ function parseBlocks(src, refs) {
       if (ind.cols >= 4) {
         const cc = { pos: 0, col: effCol };
         const pd = advanceCols(eff, cc, 4);
-        t.lines.push(' '.repeat(pd) + eff.slice(cc.pos));
+        // As in startBlockLoop: inside a container a leading tab left
+        // after the strip expands to spaces; at the top level it
+        // stays literal (probed: a code continuation '\t      \tmore'
+        // inside a list item gives 3 leading spaces, while a
+        // top-level one keeps the tab).
+        const parent = stack.length >= 2 ? stack[stack.length - 2] : null;
+        const raw = ' '.repeat(pd) + eff.slice(cc.pos);
+        t.lines.push(parent && parent.t !== 'doc' ? expandLeadingTabs(raw, cc.col - pd) : raw);
         t.el = i;
       } else {
         finalizeTop();
