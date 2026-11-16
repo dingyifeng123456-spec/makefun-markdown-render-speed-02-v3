@@ -1358,7 +1358,14 @@ function parseBlocks(src, refs) {
     }
     if (t && t.t === 'html') {
       const content = ' '.repeat(pad) + line.slice(cur.pos);
-      t.lines.push(content);
+      // A type-6 block inside a list item expands a leading tab like
+      // a paragraph does (probed: '- a\n    <div>x</div>\n
+      //   \tindented' gives '  indented'). At the top level, and for
+      // types 1-5, the tab stays literal (probed: '  <tr>\n\t<td>...'
+      // keeps the tab; a global or type-6-only expansion regressed
+      // practice doc-14, A doc-08/13/14, B doc-24).
+      const parent = stack.length >= 2 ? stack[stack.length - 2] : null;
+      t.lines.push(t.htype === 6 && parent && parent.t === 'item' ? expandLeadingTabs(content, cur.col - pad) : content);
       t.el = i;
       if (t.htype !== 6 && htmlLineHasEnd(content, t.htype, t.end)) stack.pop();
       lastLineBlank = false;
@@ -2504,7 +2511,7 @@ function renderBlock(b, refs, blankSet, emptySet) {
       let out;
       if (b.bullet) out = '<ul>\n';
       else out = b.start !== 1 ? '<ol start="' + b.start + '">\n' : '<ol>\n';
-      for (const item of b.ch) out += renderItem(item, refs, blankSet, loose, emptySet);
+      for (let i = 0; i < b.ch.length; i++) out += renderItem(b.ch[i], refs, blankSet, loose, emptySet, i === b.ch.length - 1);
       return out + (b.bullet ? '</ul>\n' : '</ol>\n');
     }
     case 'heading':
@@ -2556,7 +2563,7 @@ function renderBlock(b, refs, blankSet, emptySet) {
   }
 }
 
-function renderItem(item, refs, blankSet, loose, emptySet) {
+function renderItem(item, refs, blankSet, loose, emptySet, isLast) {
   let out = '<li>';
   const ch = item.ch;
   // A paragraph after a nested list renders with <p> even in a tight
@@ -2586,13 +2593,18 @@ function renderItem(item, refs, blankSet, loose, emptySet) {
       if (c.t === 'html' && ch.slice(i + 1).some(x => !x.dead)) {
         const term = c.htype === 6 ? blankSet : emptySet;
         if (!term.has(c.el + 1)) out += '\n';
-      } else if (c.t === 'html' && emptySet.has(c.el + 1)) {
+      } else if (c.t === 'html' && loose && !isLast && emptySet.has(c.el + 1)) {
         // An HTML block also takes a trailing newline when a truly
         // empty line follows it and no other block follows inside the
         // item (probed: type-2 comment and type-6 div both take '\n'
         // when an empty line follows and a new item starts after it).
         // A blockquote-only blank line ('>') does not count: it is in
-        // blankSet but not emptySet (practice doc-30).
+        // blankSet but not emptySet (practice doc-30). Only when the
+        // item is not the last in its list: a blank line followed by
+        // an item of a different bullet starts a new list, so the old
+        // (single-item) list takes no '\n' (probed: '8. ...\n
+        //     <div>\n\n+ At...' and '- a\n\n    code\n    <div>\n\n+
+        // b' have no '\n', while the same shapes with '- b' after do).
         out += '\n';
       }
     }
