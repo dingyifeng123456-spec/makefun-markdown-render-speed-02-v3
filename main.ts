@@ -796,7 +796,10 @@ function parseBlocks(src, refs) {
       // A fenced code block inside a list item absorbs a line that fails
       // to match the item (its content need not be indented to the item),
       // unless the line is a closing fence for it (which must match).
-      if (t && t.t === 'fence' && failedType === 'item' && !isClosingFence(line, cur.pos, cur.col, t)) {
+      // But the fence's first content line must match the item: if the
+      // fence is still empty, an unindented line ends the fence (and the
+      // item) instead of being absorbed.
+      if (t && t.t === 'fence' && failedType === 'item' && t.lines.length > 0 && !isClosingFence(line, cur.pos, cur.col, t)) {
         const eff = ' '.repeat(pad) + line.slice(cur.pos);
         const cc = { pos: 0, col: cur.col - pad };
         t.lines.push(stripFenceIndent(eff, cc, t.indent || 0, cc.col > 0));
